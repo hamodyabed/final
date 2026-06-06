@@ -1,0 +1,17 @@
+# ---- Desktop app (PyQt5) ---------------------------------------------------
+# Optional for the Streamlit deployment. Streamlit Cloud will skip these because
+# they're behind a marker that's only true on local dev machines.
+PyQt5>=5.15.9 ; platform_system != "Linux"
+PyMuPDF>=1.23.0
+sounddevice>=0.4.6 ; platform_system != "Linux"
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# ---- Shared backend ---------------------------------------------------------
+openpyxl>=3.1.2
+google-genai>=1.0.0
+
+# ---- Streamlit (mobile-friendly web UI) ------------------------------------
+streamlit>=1.40.0
+# Built-in st.audio_input handles browser microphone recording – no extra
+# dependency required for that.
