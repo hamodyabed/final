@@ -44,7 +44,12 @@ except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
     pass
 
 from app.excel_export import append_session, create_workbook, make_session_meta
-from app.gemini_scorer import GeminiScorer, GeminiScorerError
+from app.gemini_scorer import (
+    GeminiScorer,
+    GeminiScorerError,
+    analyze_video_to_columns,
+    score_video_to_answers,
+)
 from app.questions import Question, load_all_keys, load_questions
 from app.scoring import aggregate_answers_to_columns
 
@@ -132,7 +137,10 @@ st.markdown(
 # --------------------------------------------------------------------------
 def _init_state() -> None:
     ss = st.session_state
-    ss.setdefault("phase", "intake")  # intake | questions | child_finished | batch_finished
+    # Single-video analysis is the default (and only) entry point: the
+    # examiner uploads ONE session video and the app fills every Excel
+    # column automatically.
+    ss.setdefault("phase", "video_intake")  # video_intake | …
     ss.setdefault("child_info", None)  # dict
     ss.setdefault("session_id", "")
     ss.setdefault("session_dir", None)  # Path
@@ -411,6 +419,21 @@ def _append_current_child_to_batch() -> int:
 def render_intake() -> None:
     st.title("👶 بدء جلسة لطفل جديد")
     st.caption("Naela – تقييم السرد القصصي للأطفال")
+
+    # ---- Quick entry to the single-video analysis flow --------------------
+    st.info(
+        "🎥 **جديد:** يمكنك الآن رفع **فيديو واحد** للجلسة كاملة، وسيقوم "
+        "التطبيق باستخراج صوت الطفل فقط، وتحليل إجاباته، وتعبئة كل أعمدة "
+        "ملف Excel تلقائيًا — بدون تسجيل كل سؤال على حدة."
+    )
+    if st.button(
+        "🎬 تحليل فيديو واحد للجلسة الكاملة",
+        use_container_width=True,
+        type="primary",
+    ):
+        ss.phase = "video_intake"
+        st.rerun()
+    st.divider()
 
     # ---- Resume an existing in-progress session ---------------------------
     pending = _list_in_progress_sessions()
@@ -874,12 +897,164 @@ def render_batch_finished() -> None:
 
 
 # --------------------------------------------------------------------------
+# Phase: single-video analysis
+# --------------------------------------------------------------------------
+# The session recording may be a video OR an audio-only file. Gemini scores
+# both, so accept the common formats for each.
+VIDEO_TYPES = [
+    # video
+    "mp4", "mov", "webm", "mkv", "m4v", "avi",
+    # audio
+    "m4a", "mp3", "wav", "ogg", "aac", "flac",
+]
+
+
+def render_video_intake() -> None:
+    """Upload ONE session video → extract only the child's answers →
+    score every question → write a single Excel row → offer the download."""
+    st.title("🎬 تحليل فيديو الجلسة الكاملة")
+    st.caption(
+        "ارفع ملفًا واحدًا للجلسة (فيديو أو صوت). سيستمع التطبيق لصوت "
+        "الطفل فقط (متجاهلًا صوت المعلّم وصوت فيديو القصة)، ويحلّل "
+        "إجاباته، ويملأ كل أعمدة ملف Excel دفعةً واحدة."
+    )
+
+    with st.form("video_intake", clear_on_submit=False):
+        name = st.text_input("اسم الطفل *", placeholder="مثال: عبد الرحمن")
+        col1, col2 = st.columns(2)
+        with col1:
+            age = st.number_input("العمر (سنوات)", min_value=2, max_value=17, value=6)
+            gender = st.selectbox("الجنس", GENDERS, index=0)
+        with col2:
+            group = st.selectbox("المجموعة", GROUPS, index=0)
+        notes = st.text_area(
+            "ملاحظات (مدرسة، تشخيص سابق، لغة سائدة...)", height=80
+        )
+        uploaded = st.file_uploader(
+            "🎥 ملف الجلسة (فيديو أو صوت) *",
+            type=VIDEO_TYPES,
+            accept_multiple_files=False,
+            help="ملف واحد (فيديو mp4/mov… أو صوت m4a/mp3/wav…) يحتوي "
+                 "على إجابات الطفل على كل الأسئلة.",
+        )
+        submitted = st.form_submit_button(
+            "🚀 حلّل الملف واملأ Excel", use_container_width=True, type="primary"
+        )
+
+    if not submitted:
+        return
+    if not name.strip():
+        st.error("اسم الطفل مطلوب.")
+        return
+    if uploaded is None:
+        st.error("الرجاء رفع ملف الجلسة (فيديو أو صوت).")
+        return
+
+    scorer = _ensure_scorer()
+    if scorer is None:
+        st.error("تعذّر تهيئة Gemini. تأكد من ضبط GEMINI_API_KEY.")
+        return
+
+    # --- Persist the uploaded session file (video OR audio) ---------------
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    token = _safe_filename(name)
+    session_id = f"{stamp}_{token}"
+    session_dir = SESSIONS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(uploaded.name).suffix.lower() or ".mp4"
+    video_path = session_dir / f"session_media{ext}"
+    video_path.write_bytes(uploaded.getvalue())
+
+    child_info = {
+        "name": name.strip(),
+        "age": int(age),
+        "gender": gender,
+        "group": group,
+        "notes": notes.strip(),
+    }
+
+    # --- Full analysis of the whole video (fills EVERY column) -------------
+    all_keys = load_all_keys(DEFAULT_JSON)
+    with st.spinner(
+        "⏳ جارٍ تحليل الفيديو بالكامل: استخراج كلام الطفل، تقييم الإجابات، "
+        "وحساب كل أعمدة ملف Excel..."
+    ):
+        try:
+            column_values = analyze_video_to_columns(
+                video_path=video_path,
+                questions=ss.questions,
+                all_keys=all_keys,
+                rubric_by_key=ss.rubric_by_key,
+                scorer=scorer,
+            )
+        except GeminiScorerError as exc:
+            st.error(f"فشل تحليل الفيديو: {exc}")
+            return
+
+    if not column_values:
+        st.warning(
+            "لم يتمكن التطبيق من استخراج أي بيانات للطفل من هذا الملف. "
+            "تأكد من وضوح صوت الطفل في التسجيل."
+        )
+        return
+
+    # --- Write ONE row with every column ----------------------------------
+    out_path: Path = ss.batch_excel_path
+    if not out_path.exists():
+        create_workbook(DEFAULT_JSON, out_path)
+    meta = make_session_meta(
+        session_id=session_id,
+        child_name=child_info["name"],
+        child_age=str(child_info["age"]),
+        audio_dir=session_dir,
+        notes=child_info.get("notes", ""),
+        child_gender=child_info.get("gender", ""),
+        child_group=child_info.get("group", ""),
+    )
+    row = append_session(DEFAULT_JSON, out_path, meta, answers=column_values)
+
+    filled = sum(1 for v in column_values.values() if v not in (None, ""))
+    st.success(
+        f"✅ تم تحليل الفيديو وتعبئة **{filled} عمودًا** في صف Excel واحد "
+        f"للطفل «{child_info['name']}» (الصف رقم {row})."
+    )
+
+    # --- Show every filled column -----------------------------------------
+    st.subheader("📋 كل الأعمدة المستخرجة من التحليل")
+    desc_by_key = {k["key"]: k.get("description", "") for k in all_keys}
+    table_rows = [
+        {
+            "العمود": key,
+            "القيمة": column_values.get(key),
+            "الوصف": (desc_by_key.get(key, "") or "")[:60],
+        }
+        for key in (k["key"] for k in all_keys)
+    ]
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+    # --- Offer the workbook for download ----------------------------------
+    with out_path.open("rb") as f:
+        st.download_button(
+            "⬇️ تحميل ملف Excel",
+            data=f,
+            file_name="narrative_coding.xlsx",
+            mime="application/vnd.openxmlformats-officedocument."
+                 "spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    if st.button("🎬 تحليل فيديو لطفل آخر", use_container_width=True):
+        st.rerun()
+
+
+# --------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------
+# Single-video analysis is the only supported flow now: upload ONE video and
+# the app fills every Excel column. The legacy per-question recording phases
+# (intake / questions / child_finished / batch_finished) are no longer wired
+# into the router.
 PHASES = {
-    "intake": render_intake,
-    "questions": render_questions,
-    "child_finished": render_child_finished,
-    "batch_finished": render_batch_finished,
+    "video_intake": render_video_intake,
 }
-PHASES.get(ss.phase, render_intake)()
+PHASES.get(ss.phase, render_video_intake)()
