@@ -72,6 +72,34 @@ DEFAULT_PDF = DATA_DIR / "story.pdf"
 # Falls back to ``DEFAULT_VIDEO`` if the env var is empty.
 VIDEO_URL = (os.environ.get("VIDEO_URL") or "").strip()
 
+# Google Drive account whose Drive should open when the examiner clicks
+# "افتح Google Drive" in the upload tab. Falls back to the default email
+# recipient so a single account configuration drives the whole app.
+GOOGLE_DRIVE_EMAIL = (
+    os.environ.get("GOOGLE_DRIVE_EMAIL")
+    or os.environ.get("DEFAULT_EMAIL_RECIPIENT")
+    or ""
+).strip()
+
+
+def _google_drive_account_url(email: str) -> str:
+    """Return a Drive URL that opens for ``email`` via the account chooser.
+
+    Google's ``AccountChooser`` honours the ``Email`` hint and the
+    ``authuser`` parameter so a user already signed into multiple Google
+    accounts lands in the right Drive. If no email is configured we fall
+    back to the plain Drive home URL.
+    """
+    base = "https://drive.google.com/drive/u/0/my-drive"
+    if not email:
+        return base
+    from urllib.parse import quote
+    return (
+        "https://accounts.google.com/AccountChooser"
+        f"?Email={quote(email)}"
+        f"&continue={quote(base)}"
+    )
+
 
 def _google_drive_file_id(url: str) -> Optional[str]:
     """Extract the file ID from any Google Drive share/view/download URL.
@@ -92,6 +120,56 @@ def _google_drive_file_id(url: str) -> Optional[str]:
     if m:
         return m.group(1)
     return None
+
+
+def _download_drive_audio(url: str) -> tuple[Optional[bytes], str, Optional[str]]:
+    """Download the audio bytes behind a Google Drive share link.
+
+    Returns a ``(data, filename, error)`` tuple. ``data`` is ``None`` when the
+    download fails (the file must be shared as "anyone with the link"). Handles
+    Drive's large-file virus-scan confirmation page transparently.
+    """
+    file_id = _google_drive_file_id(url)
+    if not file_id:
+        return None, "", "هذا الرابط لا يبدو رابط Google Drive صالحًا."
+    try:
+        import requests
+    except ImportError:
+        return None, "", "حزمة requests غير مثبتة."
+
+    base = "https://drive.google.com/uc?export=download"
+    try:
+        session = requests.Session()
+        resp = session.get(base, params={"id": file_id}, stream=True, timeout=60)
+        # Large files return an HTML interstitial with a confirm token.
+        token = None
+        for key, value in resp.cookies.items():
+            if key.startswith("download_warning"):
+                token = value
+                break
+        if token:
+            resp = session.get(
+                base, params={"id": file_id, "confirm": token},
+                stream=True, timeout=120,
+            )
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in content_type:
+            return None, "", (
+                "تعذّر تنزيل الملف. تأكد أن مشاركة الملف على "
+                "«أي شخص لديه الرابط» (Anyone with the link)."
+            )
+        data = resp.content
+        if not data:
+            return None, "", "الملف فارغ أو غير قابل للتنزيل."
+        # Try to recover a sensible filename / extension from the headers.
+        filename = f"{file_id}.wav"
+        disp = resp.headers.get("Content-Disposition") or ""
+        m = re.search(r'filename="?([^";]+)"?', disp)
+        if m:
+            filename = m.group(1)
+        return data, filename, None
+    except Exception as exc:  # noqa: BLE001
+        return None, "", f"خطأ أثناء التنزيل: {exc}"
 
 # Streamlit Cloud filesystem is ephemeral — store sessions in a writable temp
 # folder. Local runs still keep their own ``output/sessions/`` for convenience.
@@ -663,13 +741,52 @@ def render_questions() -> None:
                 )
 
         with tab_upload:
+            # --- 1) Open Google Drive for the configured email account -----
+            drive_url = _google_drive_account_url(GOOGLE_DRIVE_EMAIL)
+            if GOOGLE_DRIVE_EMAIL:
+                st.caption(f"📂 حساب Google Drive: **{GOOGLE_DRIVE_EMAIL}**")
+            st.link_button(
+                "📂 افتح Google Drive",
+                drive_url,
+                use_container_width=True,
+                help="يفتح Google Drive للحساب المحدد في تبويب جديد لاختيار "
+                     "الملف الصوتي.",
+            )
+
+            # --- 2) Import directly from a Drive share link ---------------
+            drive_link = st.text_input(
+                "أو الصق رابط مشاركة Google Drive للملف الصوتي",
+                key=f"drvlink_{q.key}_{idx}",
+                placeholder="https://drive.google.com/file/d/.../view?usp=sharing",
+                help="انسخ رابط المشاركة من Drive (مع ضبط الإذن على «أي شخص "
+                     "لديه الرابط») ثم الصقه هنا.",
+            )
+            if st.button(
+                "⬇️ استورد من Google Drive",
+                key=f"drvimp_{q.key}_{idx}",
+                use_container_width=True,
+                disabled=not drive_link.strip() or bool(existing_audio_path),
+            ):
+                with st.spinner("جارٍ التنزيل من Google Drive…"):
+                    data, fname, err = _download_drive_audio(drive_link.strip())
+                if err:
+                    st.error(err)
+                elif data:
+                    ext = Path(fname).suffix.lower() or ".wav"
+                    if ext not in (".wav", ".mp3", ".m4a", ".ogg", ".webm"):
+                        ext = ".wav"
+                    _ingest_answer_audio(q=q, audio_bytes=data, suffix=ext)
+
+            st.divider()
+
+            # --- 3) Manual file picker (still available) -------------------
             uploaded = st.file_uploader(
-                "اختر ملفًا صوتيًا (WAV / MP3 / M4A / OGG / WEBM)",
+                "أو اختر ملفًا صوتيًا من جهازك (WAV / MP3 / M4A / OGG / WEBM)",
                 type=["wav", "mp3", "m4a", "ogg", "webm"],
                 key=f"upl_{q.key}_{idx}",
                 accept_multiple_files=False,
                 help="مفيد إذا تم تسجيل صوت الطفل من تطبيق آخر "
-                     "(مثل WhatsApp أو Voice Memos).",
+                     "(مثل WhatsApp أو Voice Memos) أو بعد تنزيله من Drive.",
             )
             if uploaded is not None and not existing_audio_path:
                 # Preserve the original extension when possible so Gemini gets

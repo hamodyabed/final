@@ -15,3 +15,5 @@ google-genai>=1.0.0
 streamlit>=1.40.0
 # Built-in st.audio_input handles browser microphone recording – no extra
 # dependency required for that.
+# Used to download audio files from Google Drive share links in the upload tab.
+requests>=2.31.0
