@@ -38,6 +38,8 @@ from typing import Dict, Optional
 
 from .scoring import (
     SCALE_BINARY,
+    SCALE_NONE,
+    SCALE_NUMERIC,
     SCALE_QUALITATIVE,
     allowed_values,
     scale_for_key,
@@ -48,14 +50,11 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
-# Free-tier daily quotas (RPD):
-#   gemini-2.5-flash-lite  → 1000 RPD  ← we use this
-#   gemini-2.5-flash       →   20 RPD  ← falling back to this would just
-#                                        fail again immediately on heavy days.
-# Therefore we deliberately do NOT chain a fallback model on the free tier.
-# Examiners who need higher throughput should enable billing (paid tier
-# removes the cap entirely).
-FALLBACK_MODEL = ""
+# When the primary model returns 503 (overloaded / high demand), we try a
+# different model rather than failing. ``gemini-2.5-flash`` is usually less
+# congested than the lite tier during demand spikes. Override via env var
+# ``GEMINI_FALLBACK_MODEL`` (set to "" to disable the fallback entirely).
+FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
 
 
 GENERAL_RULE = (
@@ -65,6 +64,39 @@ GENERAL_RULE = (
     "0 = غائب، 1 = جزئي أو محدود، 2 = واضح أو مكتمل. "
     "أي اختلاف في سلم الترميز يجب أن يُذكر صراحة داخل البند."
 )
+
+
+# Map file extensions to MIME types Gemini actually accepts. Python's
+# ``mimetypes`` returns values like ``audio/mp4a-latm`` for ``.m4a`` which
+# Gemini rejects, so we override the common audio/video formats explicitly.
+_MIME_BY_EXT = {
+    # video
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".m4v": "video/mp4",
+    ".avi": "video/x-msvideo",
+    # audio
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+
+
+def _media_mime_for(path: Path) -> str:
+    """Return a Gemini-supported MIME type for a media file.
+
+    Prefers an explicit override (so ``.m4a`` → ``audio/mp4`` etc.), then
+    falls back to ``mimetypes.guess_type``, then to ``video/mp4``.
+    """
+    ext = Path(path).suffix.lower()
+    if ext in _MIME_BY_EXT:
+        return _MIME_BY_EXT[ext]
+    return mimetypes.guess_type(str(path))[0] or "video/mp4"
 
 
 class GeminiScorerError(RuntimeError):
@@ -109,7 +141,7 @@ def _is_daily_quota_error(exc: BaseException) -> bool:
     )
 
 
-def _call_with_retry(fn, *, max_attempts: int = 4, base_delay: float = 1.5):
+def _call_with_retry(fn, *, max_attempts: int = 6, base_delay: float = 1.5):
     """Run ``fn()`` with exponential backoff for transient Gemini errors.
 
     Re-raises the last exception once all attempts are exhausted. Daily-quota
@@ -311,12 +343,22 @@ class GeminiScorer:
                 )
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                more_models_available = model != self._models_to_try[-1]
+                # Daily-quota exhaustion: permanently drop this model.
                 if _is_daily_quota_error(exc) and len(self._models_to_try) > 1:
                     logger.warning(
                         "Daily quota reached for %s – falling back to next model.",
                         model,
                     )
                     self._models_to_try.remove(model)
+                    continue
+                # Persistent overload (503) after retries: try the next model
+                # (don't drop it permanently — it may recover for later calls).
+                if _is_transient_error(exc) and more_models_available:
+                    logger.warning(
+                        "%s still overloaded after retries – trying next model.",
+                        model,
+                    )
                     continue
                 raise
         if last_exc is not None:
@@ -595,6 +637,417 @@ class GeminiScorer:
         )
 
 
+    # ------------------------------------------------------------------
+    def score_full_video(
+        self,
+        video_path: Path,
+        questions: list,
+        rubric_by_key: Dict[str, str],
+    ) -> Dict[str, "ScoreResult"]:
+        """Grade an ENTIRE recorded session from a single video file.
+
+        The video typically contains three overlapping sound sources:
+        the examiner / teacher asking the questions, the narrated story
+        video playing in the background, and the child's spoken answers.
+        Gemini is multimodal, so we send the whole clip once and instruct
+        it to **listen only to the child** (ignoring the teacher's voice
+        and the story-video narration), match each of the child's answers
+        to the matching NCP question, validate correctness against the
+        acceptable-answer reference, and return a score per question key.
+
+        Parameters
+        ----------
+        video_path:
+            Path to the uploaded video (mp4 / mov / webm / mkv …).
+        questions:
+            Ordered list of :class:`app.questions.Question` to grade.
+        rubric_by_key:
+            ``{key: description}`` from ``extracted_keys.json`` used to
+            give Gemini the full coding card for each item.
+
+        Returns
+        -------
+        ``{question_key: ScoreResult}`` — one entry per gradable question.
+        Questions Gemini did not return are filled with ``score=None``.
+        """
+        video_path = Path(video_path)
+        if not video_path.exists() or video_path.stat().st_size == 0:
+            raise GeminiScorerError("ملف الفيديو غير موجود أو فارغ.")
+
+        # Build the gradable list (skip non-scored columns).
+        gradable = [
+            q for q in questions
+            if scale_for_key(q.key) in (SCALE_BINARY, SCALE_QUALITATIVE)
+        ]
+        if not gradable:
+            return {}
+
+        prompt = self._build_video_prompt(gradable, rubric_by_key)
+
+        mime = _media_mime_for(video_path)
+        video_bytes = video_path.read_bytes()
+        video_part = self._types.Part.from_bytes(data=video_bytes, mime_type=mime)
+
+        try:
+            response = self._generate(
+                contents=[prompt, video_part],
+                config=self._types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    # A whole-session transcript + per-question reasoning can
+                    # be long, so give the model generous headroom.
+                    max_output_tokens=8192,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Gemini full-video scoring failed")
+            raise GeminiScorerError(
+                f"فشل الاتصال بـ Gemini أثناء تحليل الفيديو: {exc}"
+            ) from exc
+
+        text = (getattr(response, "text", "") or "").strip()
+        return self._parse_video_response(text, gradable)
+
+    # ------------------------------------------------------------------
+    def _build_video_prompt(
+        self,
+        questions: list,
+        rubric_by_key: Dict[str, str],
+    ) -> str:
+        """Build the Arabic prompt for grading a full-session video.
+
+        Lists every gradable question with its allowed scale + acceptable
+        answers and asks Gemini to return one JSON object keyed by
+        ``question_key``.
+        """
+        from .qa_reference import get_qa  # lazy import keeps tests quick
+
+        blocks: list = []
+        for q in questions:
+            scale = scale_for_key(q.key)
+            allowed = allowed_values(scale)
+            allowed_str = "، ".join(str(v) for v in allowed)
+            scale_hint = (
+                "ثنائي (0/1)" if scale == SCALE_BINARY
+                else "نوعي (0/1/2)"
+            )
+
+            qa = get_qa(q.key)
+            question_text = getattr(q, "text", "") or ""
+            expected = ""
+            if qa is not None and qa.acceptable_answers:
+                if qa.question_text:
+                    question_text = qa.question_text
+                expected = "؛ ".join(qa.acceptable_answers)
+            else:
+                expected = _extract_expected_answers(
+                    rubric_by_key.get(q.key, "")
+                )
+
+            blocks.append(
+                f"### المعرّف (question_key): {q.key}\n"
+                f"- السؤال: {question_text}\n"
+                f"- سلم الترميز: {scale_hint} — القيم المسموح بها: {allowed_str}\n"
+                f"- الإجابات المقبولة المرجعية: "
+                f"{expected or '(استند إلى وصف البند)'}\n"
+            )
+
+        questions_block = "\n".join(blocks)
+
+        return (
+            "أنت باحث ومحلِّل لغوي إكلينيكي متخصص في تقييم عينات السرد "
+            "القصصي لأطفال يتحدثون العربية الفلسطينية المحكية، ضمن بروتوكول "
+            "Naela لتقييم الفهم السردي (NCP).\n\n"
+
+            "## طبيعة المُدخل\n"
+            "سأرسل لك **مقطع فيديو واحدًا** لجلسة كاملة. يحتوي الفيديو على "
+            "ثلاثة مصادر صوتية متداخلة:\n"
+            "1. صوت **المعلّم/الفاحص** وهو يطرح الأسئلة على الطفل.\n"
+            "2. صوت **فيديو القصة** المسرود في الخلفية.\n"
+            "3. صوت **الطفل** وهو يجيب على الأسئلة.\n\n"
+
+            "## المطلوب منك بدقة\n"
+            "- اعزل وركّز **فقط على صوت الطفل**، وتجاهل تمامًا صوت المعلّم "
+            "وصوت فيديو القصة. لا تَعُدَّ كلام المعلّم أو سرد الفيديو إجابةً "
+            "للطفل أبدًا.\n"
+            "- استعن بالصورة (حركة شفاه الطفل، تفاعله) إن لزم لتمييز صوته.\n"
+            "- لكل سؤال في القائمة أدناه: ابحث عن إجابة الطفل المقابلة في "
+            "الفيديو، وفرّغها حرفيًا، ثم قارنها بالإجابات المقبولة المرجعية، "
+            "ثم امنحها درجة ضمن سلم الترميز المسموح به لذلك البند فقط.\n"
+            "- إذا لم يُجب الطفل عن سؤال ما، أو لم تجد إجابته في الفيديو: "
+            "ضع score = 0 و transcript = \"\" مع تبرير يوضح غياب الإجابة.\n"
+            "- كن متسامحًا مع لكنة الطفل والأخطاء العامية البسيطة ما دامت "
+            "الفكرة المطلوبة موجودة، لكن لا تكافئ إجابات غير ذات صلة.\n\n"
+
+            f"## قاعدة الترميز العامة\n{GENERAL_RULE}\n\n"
+
+            "## قائمة الأسئلة المطلوب تقييمها\n"
+            f"{questions_block}\n"
+
+            "## شكل الإخراج المطلوب (JSON فقط، بدون أي نص آخر)\n"
+            "أعد كائن JSON واحدًا مفتاحه «results» وقيمته مصفوفة، كل عنصر فيها "
+            "يخص سؤالًا واحدًا بالشكل التالي:\n"
+            "{\n"
+            "  \"results\": [\n"
+            "    {\n"
+            "      \"question_key\": \"<المعرّف كما ورد أعلاه>\",\n"
+            "      \"transcript\": \"<نص حرفي لما قاله الطفل لهذا السؤال>\",\n"
+            "      \"justification\": \"<تبرير عربي مختصر يربط الإجابة بالمعايير>\",\n"
+            "      \"score\": <عدد صحيح ضمن القيم المسموح بها لهذا البند>\n"
+            "    }\n"
+            "    // ... عنصر واحد لكل سؤال في القائمة\n"
+            "  ]\n"
+            "}\n"
+            "لا تستخدم أي قيمة درجة خارج المسموح به لكل بند، ولا تُضِف أي نص "
+            "خارج كائن JSON."
+        )
+
+    # ------------------------------------------------------------------
+    def _parse_video_response(
+        self,
+        text: str,
+        questions: list,
+    ) -> Dict[str, "ScoreResult"]:
+        """Parse the full-video JSON into ``{key: ScoreResult}``."""
+        results: Dict[str, ScoreResult] = {}
+        # Pre-fill every gradable question with a "not found" placeholder so
+        # the caller always gets a complete mapping.
+        for q in questions:
+            results[q.key] = ScoreResult(
+                score=None,
+                justification="لم تُعِد Gemini نتيجة لهذا البند.",
+            )
+
+        if not text:
+            return results
+
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        payload = None
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+            if match:
+                try:
+                    payload = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    payload = None
+        if not isinstance(payload, dict):
+            return results
+
+        items = payload.get("results")
+        if not isinstance(items, list):
+            return results
+
+        allowed_by_key = {
+            q.key: allowed_values(scale_for_key(q.key)) for q in questions
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("question_key")
+            if key not in results:
+                continue
+            allowed = allowed_by_key.get(key, [0, 1])
+            score_value = item.get("score")
+            try:
+                score_int = int(score_value)
+            except (TypeError, ValueError):
+                score_int = None
+            if score_int is not None and score_int not in allowed:
+                score_int = max(allowed[0], min(allowed[-1], score_int))
+            results[key] = ScoreResult(
+                score=score_int,
+                transcript=str(item.get("transcript", "")).strip(),
+                justification=str(item.get("justification", "")).strip(),
+                raw=text,
+            )
+        return results
+
+    # ------------------------------------------------------------------
+    def analyze_full_video(
+        self,
+        video_path: Path,
+        all_keys: list,
+    ) -> Dict[str, object]:
+        """Run a COMPLETE linguistic analysis of a session video.
+
+        Unlike :meth:`score_full_video` (which only grades the NCP
+        comprehension questions), this sends Gemini **every** column from
+        ``extracted_keys.json`` with its Arabic description and asks the
+        model to:
+
+        1. transcribe the child's full narrative (child voice only),
+        2. compute a value for **every** column — counts, ratios,
+           0/1 or 0/1/2 scores, totals, and short text/list fields —
+        3. return one JSON object ``{key: value}`` covering all columns.
+
+        Returns ``{key: value, "_transcript": str}`` ready to merge into
+        the Excel row. Values are best-effort estimates produced by the
+        model; numeric columns come back as numbers, score columns as
+        integers in range, list/text columns as strings.
+        """
+        video_path = Path(video_path)
+        if not video_path.exists() or video_path.stat().st_size == 0:
+            raise GeminiScorerError("ملف الجلسة غير موجود أو فارغ.")
+
+        prompt = self._build_full_analysis_prompt(all_keys)
+
+        mime = _media_mime_for(video_path)
+        media_bytes = video_path.read_bytes()
+        media_part = self._types.Part.from_bytes(data=media_bytes, mime_type=mime)
+
+        try:
+            response = self._generate(
+                contents=[prompt, media_part],
+                config=self._types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    # Full 78-column analysis + transcript needs lots of room.
+                    max_output_tokens=16384,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Gemini full-analysis failed")
+            raise GeminiScorerError(
+                f"فشل الاتصال بـ Gemini أثناء التحليل الكامل للفيديو: {exc}"
+            ) from exc
+
+        text = (getattr(response, "text", "") or "").strip()
+        return self._parse_full_analysis(text, all_keys)
+
+    # ------------------------------------------------------------------
+    def _build_full_analysis_prompt(self, all_keys: list) -> str:
+        """Build the Arabic prompt listing every column to be filled."""
+        lines: list = []
+        for row in all_keys:
+            key = row.get("key", "")
+            if not key:
+                continue
+            scale = scale_for_key(key)
+            if scale == SCALE_BINARY:
+                kind = "عدد صحيح 0 أو 1"
+            elif scale == SCALE_QUALITATIVE:
+                kind = "عدد صحيح 0 أو 1 أو 2"
+            elif scale == SCALE_NUMERIC:
+                kind = "عدد (مجموع/نسبة)"
+            else:
+                kind = "عدد أو نسبة أو نص قصير حسب الوصف"
+            desc = (row.get("description", "") or "").replace("\n", " ")[:200]
+            lines.append(f"- {key} [{kind}]: {desc}")
+        keys_block = "\n".join(lines)
+
+        return (
+            "أنت باحث ومحلِّل لغوي إكلينيكي خبير في تقييم عينات السرد القصصي "
+            "لأطفال يتحدثون العربية الفلسطينية المحكية، ضمن بروتوكول Naela.\n\n"
+
+            "## المُدخل\n"
+            "سأرسل لك **مقطعًا واحدًا** (فيديو أو صوت) لجلسة كاملة فيها: صوت "
+            "المعلّم وهو يسأل، وصوت فيديو القصة في الخلفية، وصوت الطفل وهو "
+            "يجيب ويسرد. ركّز **فقط على كلام الطفل** وتجاهل صوت المعلّم وصوت "
+            "فيديو القصة.\n\n"
+
+            "## المهمة\n"
+            "1. فرّغ كلام الطفل **حرفيًا وكاملًا** (كل ما قاله طوال الجلسة).\n"
+            "2. حلّل هذا التفريغ تحليلًا لغويًا شاملًا، واحسب قيمة **كل** عمود "
+            "من الأعمدة المذكورة أدناه بالاعتماد على كلام الطفل فقط.\n"
+            "3. التزم بنوع القيمة المحدد بين الأقواس لكل عمود:\n"
+            "   • أعمدة الدرجات (0/1 أو 0/1/2): أعطِ عددًا صحيحًا ضمن المدى.\n"
+            "   • أعمدة العدّ (counts) والنِّسب (ratios/percentages): أعطِ عددًا.\n"
+            "   • أعمدة القوائم أو الأمثلة النصية: أعطِ نصًا عربيًا قصيرًا "
+            "(كلمات مفصولة بفواصل)، وإن لم يوجد فاترك \"\".\n"
+            "4. **لا تترك أي عمود فارغًا**: إن تعذّر الحساب فاجعل القيمة 0 "
+            "للأعمدة الرقمية و \"\" للأعمدة النصية. قدّر بأفضل ما يمكن بدل "
+            "الترك فارغًا.\n"
+            "5. للنِّسب المئوية أعطِ رقمًا بين 0 و100. للنِّسب مثل TTR أعطِ "
+            "رقمًا عشريًا بين 0 و1.\n\n"
+
+            f"## قاعدة الترميز العامة للأعمدة الدرجية\n{GENERAL_RULE}\n\n"
+
+            "## قائمة الأعمدة المطلوب ملؤها (المعرّف ثم النوع ثم الوصف)\n"
+            f"{keys_block}\n\n"
+
+            "## شكل الإخراج المطلوب (JSON فقط، بدون أي نص آخر)\n"
+            "أعد كائن JSON واحدًا يحتوي:\n"
+            "{\n"
+            "  \"transcript\": \"<التفريغ الحرفي الكامل لكلام الطفل>\",\n"
+            "  \"columns\": {\n"
+            "     \"<key1>\": <value1>,\n"
+            "     \"<key2>\": <value2>\n"
+            "     // عنصر واحد لكل عمود من القائمة أعلاه، بلا استثناء\n"
+            "  }\n"
+            "}\n"
+            "تأكد أن مفتاح \"columns\" يحتوي **كل** المعرّفات المذكورة في "
+            "القائمة أعلاه دون نقصان."
+        )
+
+    # ------------------------------------------------------------------
+    def _parse_full_analysis(
+        self,
+        text: str,
+        all_keys: list,
+    ) -> Dict[str, object]:
+        """Parse the full-analysis JSON into ``{key: value}`` + transcript."""
+        out: Dict[str, object] = {}
+        if not text:
+            return out
+
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        payload = None
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+            if match:
+                try:
+                    payload = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    payload = None
+        if not isinstance(payload, dict):
+            return out
+
+        transcript = str(payload.get("transcript", "")).strip()
+        columns = payload.get("columns")
+        if not isinstance(columns, dict):
+            # Some models flatten it — treat the whole object as columns.
+            columns = {
+                k: v for k, v in payload.items() if k != "transcript"
+            }
+
+        valid_keys = {row.get("key") for row in all_keys}
+        for key, value in columns.items():
+            if key not in valid_keys:
+                continue
+            scale = scale_for_key(key)
+            if scale in (SCALE_BINARY, SCALE_QUALITATIVE):
+                allowed = allowed_values(scale)
+                try:
+                    ivalue = int(value)
+                except (TypeError, ValueError):
+                    # e.g. "1" or "غير متوفر" → coerce / skip
+                    try:
+                        ivalue = int(float(value))
+                    except (TypeError, ValueError):
+                        continue
+                ivalue = max(allowed[0], min(allowed[-1], ivalue))
+                out[key] = ivalue
+            else:
+                # numeric or text: store as-is (number stays number, text stays text)
+                out[key] = value
+
+        if transcript:
+            out["_transcript"] = transcript
+        return out
+
+
 # ----------------------------------------------------------------------
 # Convenience helpers
 # ----------------------------------------------------------------------
@@ -643,3 +1096,98 @@ def score_session_answers(
             result = ScoreResult(score=None, justification=str(exc))
         out[key] = result
     return out
+
+
+def score_video_to_answers(
+    video_path: Path,
+    questions: list,
+    rubric_by_key: Dict[str, str],
+    scorer: Optional[GeminiScorer] = None,
+) -> Dict[str, dict]:
+    """Score a whole session video and return an ``answers``-shaped dict.
+
+    Convenience wrapper around :meth:`GeminiScorer.score_full_video` that
+    produces ``{question_key: {"score", "transcript", "justification",
+    "question_order", "question_text"}}`` — exactly the shape consumed by
+    :func:`app.scoring.aggregate_answers_to_columns` so the result can be
+    written straight to one Excel row.
+
+    Only questions Gemini actually scored (``score is not None``) are
+    included, so unanswered items fall back to the column default.
+    """
+    scorer = scorer or GeminiScorer()
+    score_results = scorer.score_full_video(
+        video_path=Path(video_path),
+        questions=questions,
+        rubric_by_key=rubric_by_key,
+    )
+    by_key = {q.key: q for q in questions}
+    answers: Dict[str, dict] = {}
+    for key, result in score_results.items():
+        if result.score is None:
+            continue
+        q = by_key.get(key)
+        answers[key] = {
+            "question_order": getattr(q, "order", 0),
+            "question_text": getattr(q, "text", ""),
+            "score": result.score,
+            "transcript": result.transcript,
+            "justification": result.justification,
+            "scored_from": "video",
+        }
+    return answers
+
+
+def analyze_video_to_columns(
+    video_path: Path,
+    questions: list,
+    all_keys: list,
+    rubric_by_key: Dict[str, str],
+    scorer: Optional[GeminiScorer] = None,
+) -> Dict[str, object]:
+    """Produce a value for **every** Excel column from one session video.
+
+    Combines two passes so the full row is filled:
+
+    1. :meth:`GeminiScorer.score_full_video` — precise per-question NCP
+       scoring, aggregated into the macrostructure ``*_score`` columns and
+       ``macro_total_score`` via
+       :func:`app.scoring.aggregate_answers_to_columns`.
+    2. :meth:`GeminiScorer.analyze_full_video` — a complete linguistic
+       analysis that fills every remaining column (microstructure counts,
+       ratios, IPSyn / theory-of-mind scores, verb measures, language-mix
+       counts, text/list fields, …).
+
+    The precise question-derived values from pass 1 take precedence over the
+    estimates from pass 2 for the columns they cover.
+
+    Returns ``{column_key: value}`` ready to pass to
+    :func:`app.excel_export.append_session`.
+    """
+    from .scoring import aggregate_answers_to_columns
+
+    scorer = scorer or GeminiScorer()
+
+    # Pass 2 first (full analysis → baseline for every column).
+    try:
+        full_cols = scorer.analyze_full_video(
+            video_path=Path(video_path), all_keys=all_keys,
+        )
+    except GeminiScorerError as exc:
+        logger.warning("Full analysis failed, continuing with QA scores: %s", exc)
+        full_cols = {}
+    full_cols.pop("_transcript", None)
+
+    # Pass 1 (accurate NCP question scores) overrides the estimates.
+    answers = score_video_to_answers(
+        video_path=Path(video_path),
+        questions=questions,
+        rubric_by_key=rubric_by_key,
+        scorer=scorer,
+    )
+    qa_cols = aggregate_answers_to_columns(answers)
+
+    merged: Dict[str, object] = {}
+    merged.update(full_cols)
+    merged.update(qa_cols)  # precise values win
+    return merged
